@@ -1,16 +1,86 @@
-use bstr::ByteSlice;
+use bstr::{BString, ByteSlice};
 use serde_json;
-enum BencodedValue {
-    String(String),
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub enum BencodedValue {
+    BString(BString),
     Integer(i64),
     List(Vec<BencodedValue>),
-    Dictionary(Vec<(String, BencodedValue)>),
+    Dictionary(HashMap<BString, BencodedValue>),
 }
 
 impl BencodedValue {
-    fn to_json(&self) -> serde_json::Value {
+    // Function to forcibly extract
+
+    pub fn extract_dict(&self) -> Option<&HashMap<BString, BencodedValue>> {
         match self {
-            BencodedValue::String(string) => serde_json::Value::String(string.to_string()),
+            BencodedValue::Dictionary(dict) => Some(dict),
+            _ => None,
+        }
+    }
+
+    pub fn extract_bstring(&self) -> Option<&BString> {
+        match self {
+            BencodedValue::BString(bstring) => Some(bstring),
+            _ => None,
+        }
+    }
+
+    pub fn extract_integer(&self) -> Option<i64> {
+        match self {
+            BencodedValue::Integer(val) => Some(*val),
+            _ => None,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoded_value = Vec::new();
+        match self {
+            BencodedValue::BString(bstring) => {
+                encoded_value.extend(bstring.len().to_string().as_bytes());
+                encoded_value.push(':' as u8);
+                encoded_value.extend(bstring.as_bytes());
+            }
+            BencodedValue::Integer(number) => {
+                encoded_value.push('i' as u8);
+                encoded_value.extend(number.to_string().as_bytes());
+                encoded_value.push('e' as u8);
+            }
+            BencodedValue::List(list) => {
+                encoded_value.push('l' as u8);
+                for value in list.iter() {
+                    encoded_value.extend(value.encode());
+                }
+                encoded_value.push('e' as u8);
+            }
+            BencodedValue::Dictionary(map) => {
+                encoded_value.push('d' as u8);
+                // sort by key
+                let mut map: Vec<_> = map.iter().collect();
+                map.sort_by(|a, b| a.0.cmp(b.0));
+
+                for (key, value) in map.iter() {
+                    encoded_value.extend(key.len().to_string().as_bytes());
+                    encoded_value.push(':' as u8);
+                    encoded_value.extend(key.as_bytes());
+
+                    encoded_value.extend(value.encode());
+                }
+                encoded_value.push('e' as u8);
+            }
+        }
+        encoded_value
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            BencodedValue::BString(bstring) => serde_json::Value::Array(
+                bstring
+                    .to_vec()
+                    .iter()
+                    .map(|byte| serde_json::Value::Number(serde_json::Number::from(*byte))).collect(),
+            ),
             BencodedValue::Integer(number) => serde_json::Value::Number(serde_json::Number::from(
                 number.to_string().parse::<i64>().unwrap(),
             )),
@@ -33,7 +103,7 @@ impl BencodedValue {
 
     fn get_byte_length(&self) -> usize {
         match self {
-            BencodedValue::String(string) => string.len().to_string().len() + 1 + string.len(), // <length>:<string>
+            BencodedValue::BString(string) => string.len().to_string().len() + 1 + string.len(), // <length>:<string>
             BencodedValue::Integer(number) => number.to_string().len() + 2, // i<number>e
             BencodedValue::List(list) => {
                 2 + list
@@ -56,48 +126,36 @@ impl BencodedValue {
     }
 }
 
-fn decode_bencoded_string(encoded_value: &str) -> String {
+fn decode_bencoded_bstring(encoded_value: &[u8]) -> bstr::BString {
     // Example: "5:hello" -> "hello"
-    let colon_index = encoded_value.find(':').unwrap();
-    let number_string = &encoded_value[..colon_index];
+    let colon_index = encoded_value.find_char(':').unwrap();
+    let number_string = String::from_utf8_lossy(&encoded_value[..colon_index]);
     let number = number_string.parse::<i64>().unwrap();
-    let string = &encoded_value[colon_index + 1..colon_index + 1 + number as usize];
-    string.to_string()
+    let bstring = &encoded_value[colon_index + 1..colon_index + 1 + number as usize];
+    bstr::BString::from(bstring)
 }
 
 fn decode_bencoded_integer(encoded_value: &[u8]) -> i64 {
     // Example: "i3e" -> 3
-
-    let end_index;
-    end_index = match encoded_value.find_char(char::from('e')){
-        Some(ind) => ind,
-        None => panic!("No 'e' found in {}", String::from_utf8_lossy(encoded_value))
-    };
+    let end_index = encoded_value.find_char(char::from('e')).unwrap();
     let number_string = String::from_utf8_lossy(&encoded_value[1..end_index]);
     let number = number_string.parse::<i64>().unwrap();
     number
 }
 
-fn check_key_unique(key: &str, dictionary: &Vec<(String, BencodedValue)>) -> bool {
-    for (k, _) in dictionary.iter() {
-        if k == key {
-            return false;
-        }
-    }
-    true
-}
-fn decode_bencoded_value(encoded_value: &[u8]) -> BencodedValue {
+pub fn decode_bencoded_value(encoded_value: &[u8]) -> BencodedValue {
     // If encoded_value starts with a digit, it's a number
     let first_char = encoded_value.iter().next().unwrap();
     if first_char.is_ascii_digit() {
-        return BencodedValue::String(decode_bencoded_string(&String::from_utf8_lossy(encoded_value)));
+        return BencodedValue::BString(decode_bencoded_bstring(&encoded_value));
     } else if *first_char == 'i' as u8 {
         return BencodedValue::Integer(decode_bencoded_integer(encoded_value));
     } else if *first_char == 'l' as u8 {
         // Example: "l4:spam4:eggse" -> ["spam", "eggs"]
         let mut list = Vec::new();
         let mut index = 1;
-        while *encoded_value.iter().nth(index).unwrap() != 'e' as u8 && index < encoded_value.len() {
+        while *encoded_value.iter().nth(index).unwrap() != 'e' as u8 && index < encoded_value.len()
+        {
             let value = decode_bencoded_value(&encoded_value[index..]);
             let inc_size = value.get_byte_length();
             index += inc_size;
@@ -106,12 +164,13 @@ fn decode_bencoded_value(encoded_value: &[u8]) -> BencodedValue {
         return BencodedValue::List(list);
     } else if *first_char == 'd' as u8 {
         // Example: "d3:cow3:moo4:spam4:eggse" -> {"cow": "moo", "spam": "eggs"}
-        let mut dictionary = Vec::new();
+        let mut dictionary = HashMap::new();
         let mut index = 1;
-        while *encoded_value.iter().nth(index).unwrap() != 'e' as u8 && index < encoded_value.len() {
+        while *encoded_value.iter().nth(index).unwrap() != 'e' as u8 && index < encoded_value.len()
+        {
             //  Keys must be strings and appear once and only once.
-            let key = decode_bencoded_string(&String::from_utf8_lossy(&encoded_value[index..]));
-            if check_key_unique(&key, &dictionary) == false {
+            let key = decode_bencoded_bstring(&encoded_value[index..]);
+            if dictionary.contains_key(&key) {
                 panic!("Key {} is not unique", key)
             }
 
@@ -121,52 +180,18 @@ fn decode_bencoded_value(encoded_value: &[u8]) -> BencodedValue {
             let value = decode_bencoded_value(&encoded_value[index..]);
             let inc_size = value.get_byte_length();
             index += inc_size;
-            dictionary.push((key, value));
+            dictionary.insert(key, value);
         }
         return BencodedValue::Dictionary(dictionary);
     } else {
-        panic!("Unhandled encoded value: {}", String::from_utf8_lossy(encoded_value))
+        panic!(
+            "Unhandled encoded value: {}",
+            String::from_utf8_lossy(encoded_value)
+        )
     }
 }
 
 pub fn decode_bencode_to_json(encoded_value: &[u8]) -> serde_json::Value {
     let decoded_value = decode_bencoded_value(encoded_value);
     decoded_value.to_json()
-}
-
-pub fn encode_json_to_bencode(json_value: &serde_json::Value) -> Vec<u8> {
-    let mut encoded_value = Vec::new();
-    match json_value {
-        serde_json::Value::String(string) => {
-            encoded_value.extend(string.len().to_string().as_bytes());
-            encoded_value.push(':' as u8);
-            encoded_value.extend(string.as_bytes());
-        }
-        serde_json::Value::Number(number) => {
-            encoded_value.push('i' as u8);
-            encoded_value.extend(number.to_string().as_bytes());
-            encoded_value.push('e' as u8);
-        }
-        serde_json::Value::Array(array) => {
-            encoded_value.push('l' as u8);
-            for json_value in array.iter() {
-                encoded_value.extend(encode_json_to_bencode(json_value));
-            }
-            encoded_value.push('e' as u8);
-        }
-        serde_json::Value::Object(object) => {
-            encoded_value.push('d' as u8);
-            // sort by key
-            let mut object: Vec<_> = object.iter().collect();
-            object.sort_by(|a, b| a.0.cmp(b.0));
-
-            for (key, json_value) in object.iter() {
-                encoded_value.extend(encode_json_to_bencode(&serde_json::Value::String(key.to_string())));
-                encoded_value.extend(encode_json_to_bencode(json_value));
-            }
-            encoded_value.push('e' as u8);
-        }
-        _ => panic!("Unhandled json value: {}", json_value),
-    }
-    encoded_value
 }
