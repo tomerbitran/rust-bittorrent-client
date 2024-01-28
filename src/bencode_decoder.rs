@@ -130,7 +130,7 @@ fn decode_bencoded_bstring(encoded_value: &[u8]) -> bstr::BString {
     // Example: "5:hello" -> "hello"
     let colon_index = encoded_value.find_char(':').unwrap();
     let number_string = String::from_utf8_lossy(&encoded_value[..colon_index]);
-    let number = number_string.parse::<i64>().unwrap();
+    let number = number_string.parse::<i64>().expect("Invalid number ");
     let bstring = &encoded_value[colon_index + 1..colon_index + 1 + number as usize];
     bstr::BString::from(bstring)
 }

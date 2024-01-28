@@ -1,5 +1,6 @@
 use bstr::BString;
 use hex::encode;
+use rand::Rng;
 use serde_json;
 use sha1::{Digest, Sha1};
 use std::env;
@@ -8,7 +9,8 @@ mod bencode_decoder;
 use bencode_decoder::BencodedValue;
 use bencode_decoder::*;
 
-
+mod peer_comm;
+use peer_comm::PeerConnection;
 
 #[allow(dead_code)]
 struct TorrentFileInfo {
@@ -90,6 +92,68 @@ impl TorrentFile {
     }
 }
 
+fn url_encode_hash(hash: &str) -> String {
+    let bytes: Vec<u8> = (0..hash.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hash[i..i + 2], 16).unwrap())
+        .collect();
+    bytes.iter().map(|b| format!("%{:02X}", b)).collect()
+}
+
+fn get_random_peer_id() -> String {
+    let mut peer_id = String::from("-TR2920-");
+    let mut rng = rand::thread_rng();
+    for _ in 0..12 {
+        let random_number = rng.gen_range(0..10);
+        peer_id.push_str(&random_number.to_string());
+    }
+    peer_id
+}
+
+fn get_peers(
+    announce_url: &str,
+    info_hash: &str,
+    peer_id: &str,
+    port: u16,
+    length: u64,
+) -> Result<Vec<String>, reqwest::Error> {
+    let url = format!(
+        "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1",
+        announce_url,
+        url_encode_hash(info_hash),
+        peer_id,
+        port,
+        length
+    );
+
+    let response = reqwest::blocking::get(&url)?;
+    let body = response.bytes().expect("error reading response");
+    let decoded_body = decode_bencoded_value(&body.to_vec());
+    let dictionary = decoded_body.extract_dict().unwrap();
+    let peers = dictionary
+        .get(&BString::from("peers"))
+        .expect("error in response")
+        .extract_bstring()
+        .expect("invalid peers??");
+
+    let mut index = 0;
+    let mut peer_list = Vec::new();
+    while index < peers.len() - 5 {
+        let ip = format!(
+            "{}.{}.{}.{}",
+            peers[index],
+            peers[index + 1],
+            peers[index + 2],
+            peers[index + 3]
+        );
+        let port = u16::from_be_bytes([peers[index + 4], peers[index + 5]]);
+        let peer = format!("{}:{}", ip, port);
+        peer_list.push(peer);
+        index += 6;
+    }
+    Ok(peer_list)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -99,26 +163,78 @@ fn main() {
 
     let command = &args[1];
 
-    if command == "decode" {
-        let encoded_value = &args[2];
-        let encoded_bytes = encoded_value.as_bytes();
-        let json_value: serde_json::Value = decode_bencode_to_json(&encoded_bytes.to_vec());
-        println!("{}", json_value.to_string());
-    } else if command == "info" {
-        let filename = &args[2];
-        // read file
-        let content = std::fs::read(filename).expect("Something went wrong reading the file");
-        let parsed_file = decode_bencoded_value(&content);
-        let torrent_file = TorrentFile::new(&parsed_file);
-
-        println!("Tracker URL: {}", torrent_file.announce);
-        println!("Length: {}", torrent_file.info.length);
-        println!("Info hash: {}", torrent_file.info.info_hash);
-        println!("Piece Hashes:");
-        for piece_hash in torrent_file.info.piece_hashes.iter() {
-            println!("  {}", piece_hash);
+    match command.as_str() {
+        "decode" => {
+            let encoded_value = &args[2];
+            let encoded_bytes = encoded_value.as_bytes();
+            let json_value: serde_json::Value = decode_bencode_to_json(&encoded_bytes.to_vec());
+            println!("{}", json_value.to_string());
         }
-    } else {
-        println!("unknown command: {}", args[1])
+        "info" => {
+            let filename = &args[2];
+            // read file
+            let content = std::fs::read(filename).expect("Something went wrong reading the file");
+            let parsed_file = decode_bencoded_value(&content);
+            let torrent_file = TorrentFile::new(&parsed_file);
+
+            println!("Tracker URL: {}", torrent_file.announce);
+            println!("Length: {}", torrent_file.info.length);
+            println!("Info hash: {}", torrent_file.info.info_hash);
+            println!("Piece Hashes:");
+            for piece_hash in torrent_file.info.piece_hashes.iter() {
+                println!("  {}", piece_hash);
+            }
+        }
+        "peers" => {
+            let filename = &args[2];
+            let content = std::fs::read(filename).expect("Something went wrong reading the file");
+            let parsed_file = decode_bencoded_value(&content);
+            let torrent_file = TorrentFile::new(&parsed_file);
+
+            let client_peer_id = get_random_peer_id(); // length of this string must be 20
+            let port = 6881;
+            let info_hash = torrent_file.info.info_hash;
+            let announce_url = torrent_file.announce;
+            let file_length = torrent_file.info.length;
+            let tracker_response = get_peers(
+                &announce_url,
+                &info_hash,
+                client_peer_id.as_str(),
+                port,
+                file_length,
+            );
+            match tracker_response {
+                Ok(peers) => {
+                    println!("Peers:");
+                    for peer in peers.iter() {
+                        println!("  {}", peer);
+                    }
+                }
+                Err(e) => println!("Error: {}", e),
+            }
+        }
+        "handshake" => {
+            let filename = &args[2];
+            let peer_address_port = &args[3]; // <address>:<port>
+            let peer_address_port: Vec<&str> = peer_address_port.split(':').collect();
+            let peer_address = peer_address_port[0];
+            let peer_port = peer_address_port[1].parse::<u16>().expect("invalid port");
+
+            let content = std::fs::read(filename).expect("Something went wrong reading the file");
+            let parsed_file = decode_bencoded_value(&content);
+            let torrent_file = TorrentFile::new(&parsed_file);
+
+            let client_peer_id = get_random_peer_id(); // length of this string must be 20
+            let info_hash_bytes = (0..torrent_file.info.info_hash.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&torrent_file.info.info_hash[i..i + 2], 16).unwrap())
+                .collect();
+            let mut peer_connection = PeerConnection::new(peer_address.to_string(), peer_port);
+
+            let remote_peer_id =
+                peer_connection.handshake(&info_hash_bytes, &client_peer_id.as_bytes().to_vec());
+            println!("Peer ID:{}", encode(&remote_peer_id));
+        }
+        _ => println!("unknown command: {}", args[1]),
     }
 }
